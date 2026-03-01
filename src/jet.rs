@@ -786,7 +786,7 @@ pub fn now_ms() -> f64 {
 pub struct StorageHandle(web_sys::Storage);
 
 impl StorageHandle {
-    pub fn local_storage() -> Option<Self> {
+    pub fn new() -> Option<Self> {
         web_sys::window()?
             .local_storage()
             .ok()
@@ -794,12 +794,13 @@ impl StorageHandle {
             .map(StorageHandle)
     }
 
-    pub fn get_item(&self, key: &str) -> Option<String> {
-        self.0.get_item(key).ok().flatten()
+    delegate! {
+    to self.0 {
+    #[unwrap]
+    pub fn get_item(&self, key: &str) -> Option<String>;
+    #[unwrap] // no return value anyway
+    pub fn set_item(&self, key: &str, value: &str);
     }
-
-    pub fn set_item(&self, key: &str, value: &str) {
-        let _ = self.0.set_item(key, value);
     }
 }
 

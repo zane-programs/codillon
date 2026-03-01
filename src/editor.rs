@@ -16,9 +16,10 @@ use crate::{
         FrameInfo, FrameInfosMut, InstrKind, LineInfos, LineInfosMut, LineKind, SyntheticWasm,
         find_frames, find_function_ranges, fix_syntax,
     },
-    utils::{CodillonType, FmtError, RawModule, ValidModule, lines_to_content, str_to_binary},
+    utils::{CodillonType, FmtError, RawModule, ValidModule, str_to_binary},
 };
 use anyhow::{Context, Result, bail};
+use itertools::Itertools;
 use std::{
     cell::{Ref, RefCell, RefMut},
     cmp::min,
@@ -44,6 +45,7 @@ type ComponentType = DomStruct<
 >;
 
 pub const LINE_SPACING: usize = 40;
+const STORAGE_ID: &str = "codillon_content";
 
 #[derive(Clone, Default)]
 pub struct ProgramState {
@@ -59,6 +61,7 @@ struct _Editor {
     component: ComponentType,
     factory: ElementFactory,
     action_history: ActionHistory,
+    storage: Option<StorageHandle>,
 
     program_state: ProgramState,
     function_locals: Vec<Vec<WebAssemblyTypes>>,
@@ -90,6 +93,7 @@ impl Editor {
             ),
             factory,
             action_history: ActionHistory::default(),
+            storage: StorageHandle::new(),
             program_state: ProgramState::default(),
             function_locals: Vec::new(),
             globals: Vec::new(),
@@ -132,27 +136,20 @@ impl Editor {
         ret.image_mut().set_attribute("class", "annotations");
 
         // Restore from localStorage, or use default content
-        let mut restored_ok = false;
-        if let Some(content) = restore_from_local_storage()
-            && !content.is_empty()
+        if let Some(storage) = StorageHandle::new()
+            && let Some(content) = storage.get_item(STORAGE_ID)
         {
             for line_str in content.lines() {
                 ret.push_line(line_str);
             }
-            if ret.on_change().is_ok() {
-                restored_ok = true;
-            } else {
-                // Clear malformed restored content and fall back to default
-                let len = ret.text().len();
-                if len > 0 {
-                    ret.text_mut().remove_range(0, len);
-                }
-            }
+            if ret.on_change().is_err() {
+                ret.set_default_contents()
+            };
+        } else {
+            ret.set_default_contents();
         }
-        if !restored_ok {
-            ret.push_default_lines();
-            ret.on_change().expect("well-formed initial contents");
-        }
+
+        ret.on_change().expect("well-formed initial contents");
 
         let height = LINE_SPACING * ret.text().len();
         ret.image_mut().set_attribute("height", &height.to_string());
@@ -165,30 +162,15 @@ impl Editor {
         self.text_mut().push(newline);
     }
 
-    fn push_default_lines(&mut self) {
+    fn set_default_contents(&mut self) {
+        let len = self.len();
+        self.text_mut().remove_range(0, len);
         self.push_line("(func");
         self.push_line("i32.const 5");
         self.push_line("i32.const 6");
         self.push_line("i32.add");
         self.push_line("drop");
         self.push_line(")");
-    }
-
-    fn get_content(&self) -> String {
-        let text = self.text();
-        let len = text.len();
-        let mut lines = Vec::with_capacity(len);
-        for i in 0..len {
-            lines.push(text[i].suffix(Position::begin()).unwrap_or_default());
-        }
-        lines_to_content(&lines)
-    }
-
-    fn save_to_local_storage(&self) {
-        let content = self.get_content();
-        if let Some(storage) = StorageHandle::local_storage() {
-            storage.set_item("codillon_content", &content);
-        }
     }
 
     fn get_lines_and_positions(
@@ -545,9 +527,17 @@ impl Editor {
         RefMut::map(self.text_mut(), |c| &mut c[idx])
     }
 
-    // get the "instructions" (active, well-formed lines) as text
+    // get the user-entered text buffer (doesn't include synthetic Wasm)
     fn buffer_as_text(&self) -> impl Iterator<Item = Ref<'_, str>> {
-        InstructionTextIterator {
+        UserTextIterator {
+            editor: self.text(),
+            line_field_idx: 0,
+        }
+    }
+
+    // get the active, well-formed line contents
+    fn active_as_text(&self) -> impl Iterator<Item = Ref<'_, str>> {
+        ActiveTextIterator {
             editor: self.text(),
             line_idx: 0,
             active_str_idx: 0,
@@ -564,11 +554,7 @@ impl Editor {
         // Get function ranges
         self.0.borrow_mut().function_ranges = find_function_ranges(self);
 
-        let wasm_bin = str_to_binary(
-            self.buffer_as_text()
-                .fold(String::new(), |acc, elem| acc + "\n" + elem.as_ref()),
-        )?;
-
+        let wasm_bin = str_to_binary(self.active_as_text().join(" "))?;
         let raw_module = RawModule::new(self, &wasm_bin, &self.0.borrow().function_ranges)?;
         let validized = raw_module.fix_validity(&wasm_bin, self)?;
         let types = validized.to_types_table(&wasm_bin)?;
@@ -620,7 +606,13 @@ impl Editor {
         self.initialize_locals(&validized);
         self.execute(&validized.build_executable_binary(&types)?);
 
-        self.save_to_local_storage();
+        // save to local storage
+        {
+            let as_text = self.buffer_as_text().join("");
+            if let Some(storage) = &self.0.borrow_mut().storage {
+                storage.set_item(STORAGE_ID, &as_text);
+            }
+        }
 
         #[cfg(debug_assertions)]
         self.audit();
@@ -956,17 +948,38 @@ impl Editor {
     }
 }
 
-fn restore_from_local_storage() -> Option<String> {
-    StorageHandle::local_storage()?.get_item("codillon_content")
+pub struct UserTextIterator<'a> {
+    editor: Ref<'a, TextType>,
+    line_field_idx: usize,
 }
 
-pub struct InstructionTextIterator<'a> {
+impl<'a> Iterator for UserTextIterator<'a> {
+    type Item = Ref<'a, str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.line_field_idx == self.editor.len() * 3 {
+            return None;
+        }
+
+        let (line_idx, field_idx) = (self.line_field_idx / 3, self.line_field_idx % 3);
+        self.line_field_idx += 1;
+
+        let line = Ref::map(Ref::clone(&self.editor), |x| &x[line_idx]);
+        Some(Ref::map(line, |x| match field_idx {
+            0 => x.instr().get(),
+            1 => x.comment().get(),
+            _ => "\n",
+        }))
+    }
+}
+
+pub struct ActiveTextIterator<'a> {
     editor: Ref<'a, TextType>,
     line_idx: usize,
     active_str_idx: usize,
 }
 
-impl<'a> Iterator for InstructionTextIterator<'a> {
+impl<'a> Iterator for ActiveTextIterator<'a> {
     type Item = Ref<'a, str>;
 
     fn next(&mut self) -> Option<Self::Item> {
